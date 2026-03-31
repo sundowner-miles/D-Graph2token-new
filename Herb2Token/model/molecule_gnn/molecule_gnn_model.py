@@ -183,6 +183,41 @@ class GNN_graphpred(nn.Module):
         self.molecule_node_model.load_state_dict(state_dict)
         return
 
+    # [新增] 精准冻结底层函数
+    def freeze_bottom_layers(self, tune_layers=1):
+        """
+        冻结 GNN 的底层参数以保留预训练的分子通用特征，
+        仅微调顶部的 `tune_layers` 层以适配当前任务。
+        """
+        num_layers = self.molecule_node_model.num_layer
+        if tune_layers < 0 or tune_layers > num_layers:
+            raise ValueError(f"tune_layers 必须在 0 到 {num_layers} 之间。")
+
+        # 1. 绝对冻结底层的 Atom Encoder (基础原子映射无需微调)
+        for param in self.molecule_node_model.atom_encoder.parameters():
+            param.requires_grad = False
+
+        # 2. 冻结前面的 GNN 卷积层和 BatchNorm 层
+        freeze_up_to = num_layers - tune_layers
+        for i in range(freeze_up_to):
+            for param in self.molecule_node_model.gnns[i].parameters():
+                param.requires_grad = False
+            for param in self.molecule_node_model.batch_norms[i].parameters():
+                param.requires_grad = False
+
+        # 3. 确保顶层 (tune_layers) 的梯度是开启的
+        for i in range(freeze_up_to, num_layers):
+            for param in self.molecule_node_model.gnns[i].parameters():
+                param.requires_grad = True
+            for param in self.molecule_node_model.batch_norms[i].parameters():
+                param.requires_grad = True
+
+        # 4. 确保图级输出线性层的梯度是开启的
+        for param in self.graph_pred_linear.parameters():
+            param.requires_grad = True
+
+        print(f"GNN 底层已冻结。目前仅微调顶部的 {tune_layers} 层 GNN。")
+
     def forward(self, *argv):
         if len(argv) == 4:
             x, edge_index, edge_attr, batch = argv[0], argv[1], argv[2], argv[3]
