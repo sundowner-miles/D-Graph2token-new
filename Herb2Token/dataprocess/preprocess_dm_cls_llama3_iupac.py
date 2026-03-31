@@ -27,28 +27,30 @@ class TrainCollater:
             self.reg_token_id = reg_token_id
 
     def __call__(self, batch):
-        # 注意这里解包多了一个 graphs_B_batch
         graphs_A_batch, graphs_B_batch, instruction, text_values = zip(*batch)
         
         flat_graphs_A = []
-        herb_idx_A = []
+        herb_batch_A = []  # [修改命名]
         flat_graphs_B = []
-        herb_idx_B = []
+        herb_batch_B = []  # [修改命名]
         
-        # 展平分子列表，并记录它们属于当前 Batch 中的第几个草药(样本)
         for sample_idx, (g_A_list, g_B_list) in enumerate(zip(graphs_A_batch, graphs_B_batch)):
             flat_graphs_A.extend(g_A_list)
-            herb_idx_A.extend([sample_idx] * len(g_A_list))
+            herb_batch_A.extend([sample_idx] * len(g_A_list))  # [修改命名]
             
             flat_graphs_B.extend(g_B_list)
-            herb_idx_B.extend([sample_idx] * len(g_B_list))
+            herb_batch_B.extend([sample_idx] * len(g_B_list))  # [修改命名]
+
+        flat_graphs_A = [g for g in flat_graphs_A if isinstance(g, Data)]
+        flat_graphs_B = [g for g in flat_graphs_B if isinstance(g, Data)]
             
-        # 使用 PyG 将多分子打包成巨型 Batch 图
         batched_A = Batch.from_data_list(flat_graphs_A)
-        batched_A.herb_idx = torch.tensor(herb_idx_A, dtype=torch.long)
+        # [核心修改] 属性必须叫 herb_batch
+        batched_A.herb_batch = torch.tensor(herb_batch_A, dtype=torch.long)
         
         batched_B = Batch.from_data_list(flat_graphs_B)
-        batched_B.herb_idx = torch.tensor(herb_idx_B, dtype=torch.long)
+        # [核心修改] 属性必须叫 herb_batch
+        batched_B.herb_batch = torch.tensor(herb_batch_B, dtype=torch.long)
 
         self.tokenizer.padding_side = 'right'
         self.tokenizer.truncation_side = 'left'
@@ -78,29 +80,27 @@ class InferenceCollater:
             self.reg_token_id = reg_token_id
 
     def __call__(self, batch):
-        # 注意这里解包多了一个 graphs_B_batch
         graphs_A_batch, graphs_B_batch, instruction, text_values = zip(*batch)
         
         flat_graphs_A = []
-        herb_idx_A = []
+        herb_batch_A = []  # [修改命名]
         flat_graphs_B = []
-        herb_idx_B = []
+        herb_batch_B = []  # [修改命名]
         
-        # 展平分子列表，并记录它们属于当前 Batch 中的第几个草药(样本)
         for sample_idx, (g_A_list, g_B_list) in enumerate(zip(graphs_A_batch, graphs_B_batch)):
             flat_graphs_A.extend(g_A_list)
-            herb_idx_A.extend([sample_idx] * len(g_A_list))
+            herb_batch_A.extend([sample_idx] * len(g_A_list))
             
             flat_graphs_B.extend(g_B_list)
-            herb_idx_B.extend([sample_idx] * len(g_B_list))
+            herb_batch_B.extend([sample_idx] * len(g_B_list))
             
-        # 使用 PyG 将多分子打包成巨型 Batch 图
         batched_A = Batch.from_data_list(flat_graphs_A)
-        batched_A.herb_idx = torch.tensor(herb_idx_A, dtype=torch.long)
+        # [核心修改]
+        batched_A.herb_batch = torch.tensor(herb_batch_A, dtype=torch.long)
         
         batched_B = Batch.from_data_list(flat_graphs_B)
-        batched_B.herb_idx = torch.tensor(herb_idx_B, dtype=torch.long)
-
+        # [核心修改]
+        batched_B.herb_batch = torch.tensor(herb_batch_B, dtype=torch.long)
         
         self.tokenizer.padding_side = 'right'
         self.tokenizer.truncation_side = 'left'
@@ -117,7 +117,10 @@ class InferenceCollater:
         is_reg_token = instruction_tokens.input_ids == self.reg_token_id
         instruction_tokens['is_reg_token'] = is_reg_token
 
-        # 返回值从 graphs 变成了 batched_A 和 batched_B
+        # ====== 核心修复：将元组转换为张量 ======
+        text_values = torch.tensor(text_values).to(torch.int64) 
+        
+        # 返回值确保所有元素都是张量格式
         return batched_A, batched_B, instruction_tokens, text_values
 
 
@@ -161,12 +164,19 @@ def herb_smiles_list2graphs(smiles_list):
         if graph is not None:
             graph_list.append(graph)
             
-    # 如果该草药完全没有有效分子，为了防止报错，给一个占位的空图（只含有一个全零节点）
+    # 如果该草药完全没有有效分子，创建一个“对齐”的占位图
     if len(graph_list) == 0:
+        # 核心修改：根据 features.py 确定的维度对齐
+        node_feat_dim = 9  # atom_to_feature_vector 返回 9 个特征
+        edge_feat_dim = 3  # bond_to_feature_vector 返回 3 个特征
+        
         empty_data = Data(
-            x=torch.zeros((1, 1), dtype=torch.long), 
+            # x 的形状必须是 [1, 9]，否则 Batch.from_data_list 会报错
+            x=torch.zeros((1, node_feat_dim), dtype=torch.long), 
+            # edge_index 保持 [2, 0]
             edge_index=torch.empty((2, 0), dtype=torch.long),
-            edge_attr=torch.empty((0, 0), dtype=torch.long)
+            # edge_attr 的形状必须是 [0, 3] 以对齐特征列数
+            edge_attr=torch.empty((0, edge_feat_dim), dtype=torch.long)
         )
         graph_list.append(empty_data)
         
@@ -258,13 +268,14 @@ class HerbHerbDataset(Dataset):
             'SMILES': list                     # 成分SMILES列表
         }).reset_index()
         
-        # -------------------------- 4. 定义Prompt模板（原有逻辑不变） --------------------------
+        # -------------------------- 4. 定义Prompt模板 (修改点) --------------------------
         self.prompt_template = {
             "herb1_name": "The name of Herb1 is {herb1_name}.",
             "herb2_name": "The name of Herb2 is {herb2_name}.",
             "herb1_comp": "Herb 1 contains the following components:\n{herb1_comp_str}\n",
             "herb2_comp": "Herb 2 contains the following components:\n{herb2_comp_str}",
-            "graph_info": "\nThe graph representations of the above molecular components are <|mol_g|> (array format, in the same order as the above components).",
+            # [核心修改]：放入2个 <|mol_g|>，分别对应 H_{A|B} 和 H_{B|A} 的宏观物理表征
+            "graph_info": "\nThe graph representations of the above macro interactions are <|mol_g|><|mol_g|> (array format, representing Herb1 and Herb2 dynamics).",
             "instruction": "\nIn traditional Chinese medicine, herbal compatibility is a core principle, and the association between different herbs directly affects the efficacy and safety of formulations. Based on the IUPAC names of the components of Herb 1 and Herb 2 and their molecular graph representations (array format), is there an effective association between Herb 1 and Herb 2?",
             "predict_req": "\nPlease take into account the names of the herbal components and their graph representations (array), and generate the predictions <|reg_g|>."
         }
@@ -273,11 +284,11 @@ class HerbHerbDataset(Dataset):
         self.samples = self._load_or_generate_samples()
 
     def _get_cache_filename(self):
-        """生成唯一的缓存文件名，包含关键参数哈希，避免冲突"""
-        # 拼接关键参数生成哈希
-        param_str = f"split={self.split}_txtmaxlen={self.text_max_len}_splitbytxt={self.split_by_txt}"
-        param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
-        return self.cache_dir / f"herb_herb_samples_{self.split}_{param_hash}.pt"
+            """生成唯一的缓存文件名，包含关键参数哈希，避免冲突"""
+            # [修改点]：在 param_str 里加一个版本号 (v2)，强制作废以前的单 mol_g 缓存
+            param_str = f"v2_split={self.split}_txtmaxlen={self.text_max_len}_splitbytxt={self.split_by_txt}"
+            param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
+            return self.cache_dir / f"herb_herb_samples_{self.split}_{param_hash}.pt"
 
     def _load_samples_cache(self):
         """从缓存文件加载预处理后的样本（适配PyTorch 2.6+安全机制）"""
@@ -577,7 +588,7 @@ class ProcessDatasets(LightningDataModule):
         parser.add_argument('--num_workers', type=int, default=2, help="数据加载的worker数")
         parser.add_argument('--batch_size', type=int, default=5, help="训练批次大小")
         parser.add_argument('--inference_batch_size', type=int, default=1, help="推理批次大小")
-        parser.add_argument('--root', type=str, default='data/Herb-Herb_allin/', help="草药数据根路径")
+        parser.add_argument('--root', type=str, default='data/Herb-Herb_c500/', help="草药数据根路径")
         parser.add_argument('--text_max_len', type=int, default=512, help="文本最大长度（适配长Prompt）")
         parser.add_argument('--split_by_txt', action='store_false', help="是否按独立txt文件划分（默认True，关闭则用csv的split列）")
         # 新增缓存相关参数

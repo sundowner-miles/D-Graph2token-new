@@ -361,8 +361,11 @@ class QA_Trainer(pl.LightningModule):
 
         list_predictions, list_targets = zip(*outputs)
 
-        predictions = [tensor.float() for tensor in list_predictions]
-        targets = [tensor.float() for tensor in list_targets]
+        # 针对 predictions 的防御性转换
+        predictions = [p.float() if isinstance(p, torch.Tensor) else torch.tensor(p).float() for p in list_predictions]
+        
+        # ====== 针对 targets 的防御性转换（修复 AttributeError） ======
+        targets = [t.float() if isinstance(t, torch.Tensor) else torch.tensor(t).float() for t in list_targets]
 
         predictions = torch.cat(predictions, dim=0).cpu().numpy()
         targets = torch.cat(targets, dim=0).cpu().numpy()
