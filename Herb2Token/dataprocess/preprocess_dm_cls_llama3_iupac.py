@@ -18,13 +18,13 @@ try:
 except Exception as e:
     print(f"添加安全白名单失败（低版本PyTorch无需处理）：{e}")
 
-# 保持原有Collater逻辑（仅输入数据类型变化，拼接逻辑不变）
+# ===================== 修改：TrainCollater 适配 interaction_token =====================
 class TrainCollater:
-    def __init__(self, tokenizer, text_max_len, mol_token_id, reg_token_id):
-            self.text_max_len = text_max_len
-            self.tokenizer = tokenizer
-            self.mol_token_id = mol_token_id
-            self.reg_token_id = reg_token_id
+    def __init__(self, tokenizer, text_max_len, interaction_token_id, reg_token_id):
+        self.text_max_len = text_max_len
+        self.tokenizer = tokenizer
+        self.interaction_token_id = interaction_token_id
+        self.reg_token_id = reg_token_id
 
     def __call__(self, batch):
         graphs_A_batch, graphs_B_batch, instruction, text_values = zip(*batch)
@@ -62,8 +62,10 @@ class TrainCollater:
                                             return_tensors='pt',
                                             return_attention_mask=True)
 
-        is_mol_token = instruction_tokens.input_ids == self.mol_token_id
-        instruction_tokens['is_mol_token'] = is_mol_token
+        # ====== 核心修改：生成 interaction_token 掩码 ======
+        is_interaction_token = instruction_tokens.input_ids == self.interaction_token_id
+        instruction_tokens['is_interaction_token'] = is_interaction_token
+        
         is_reg_token = instruction_tokens.input_ids == self.reg_token_id
         instruction_tokens['is_reg_token'] = is_reg_token
 
@@ -71,13 +73,13 @@ class TrainCollater:
         # 返回值从 graphs 变成了 batched_A 和 batched_B
         return batched_A, batched_B, instruction_tokens, text_values
 
-
+# ===================== 修改：InferenceCollater 适配 interaction_token =====================
 class InferenceCollater:
-    def __init__(self, tokenizer, text_max_len, mol_token_id, reg_token_id):
-            self.text_max_len = text_max_len
-            self.tokenizer = tokenizer
-            self.mol_token_id = mol_token_id
-            self.reg_token_id = reg_token_id
+    def __init__(self, tokenizer, text_max_len, interaction_token_id, reg_token_id):
+        self.text_max_len = text_max_len
+        self.tokenizer = tokenizer
+        self.interaction_token_id = interaction_token_id
+        self.reg_token_id = reg_token_id
 
     def __call__(self, batch):
         graphs_A_batch, graphs_B_batch, instruction, text_values = zip(*batch)
@@ -112,8 +114,10 @@ class InferenceCollater:
                                             truncation=True,
                                             return_attention_mask=True)
 
-        is_mol_token = instruction_tokens.input_ids == self.mol_token_id
-        instruction_tokens['is_mol_token'] = is_mol_token
+        # ====== 核心修改：生成 interaction_token 掩码 ======
+        is_interaction_token = instruction_tokens.input_ids == self.interaction_token_id
+        instruction_tokens['is_interaction_token'] = is_interaction_token
+        
         is_reg_token = instruction_tokens.input_ids == self.reg_token_id
         instruction_tokens['is_reg_token'] = is_reg_token
 
@@ -203,7 +207,8 @@ class HerbHerbDataset(Dataset):
         :param cache_dir: 缓存文件保存目录（默认root_path/cache）
         """
         self.text_max_len = text_max_len
-        self.mol_g = '<|mol_g|>'
+        # [修改点] 将 mol_g 变量名改为 interaction_g
+        self.interaction_g = '<|herb_interaction|>'
         self.reg_g = '<|reg_g|>'
         self.split_by_txt = split_by_txt
         self.split = split
@@ -270,14 +275,15 @@ class HerbHerbDataset(Dataset):
         
         # -------------------------- 4. 定义Prompt模板 (修改点) --------------------------
         self.prompt_template = {
-            "herb1_name": "The name of Herb1 is {herb1_name}.",
-            "herb2_name": "The name of Herb2 is {herb2_name}.",
+            "herb1_name": "The name of Herb 1 is {herb1_name}.",
+            "herb2_name": "The name of Herb 2 is {herb2_name}.",
             "herb1_comp": "Herb 1 contains the following components:\n{herb1_comp_str}\n",
             "herb2_comp": "Herb 2 contains the following components:\n{herb2_comp_str}",
-            # [核心修改]：放入2个 <|mol_g|>，分别对应 H_{A|B} 和 H_{B|A} 的宏观物理表征
-            "graph_info": "\nThe graph representations of the above macro interactions are <|mol_g|><|mol_g|> (array format, representing Herb1 and Herb2 dynamics).",
-            "instruction": "\nIn traditional Chinese medicine, herbal compatibility is a core principle, and the association between different herbs directly affects the efficacy and safety of formulations. Based on the IUPAC names of the components of Herb 1 and Herb 2 and their molecular graph representations (array format), is there an effective association between Herb 1 and Herb 2?",
-            "predict_req": "\nPlease take into account the names of the herbal components and their graph representations (array), and generate the predictions <|reg_g|>."
+            # [核心修改 1]：将原来的两个 <|mol_g|> 替换为 1 个 <|herb_interaction|>
+            "graph_info": "\nThe interaction between Herb 1 and Herb 2 is represented as: <|herb_interaction|> (array format, representing the heuristic matching fusion dynamics of herbal compatibility).",
+            # [核心修改 2]：调整 instruction 中的描述，强调现在输入的是“融合后的交互表征”而不是分别的分子图表征
+            "instruction": "\nIn traditional Chinese medicine, herbal compatibility is a core principle, and the association between different herbs directly affects the efficacy and safety of formulations. Based on the IUPAC names of the components of Herb 1 and Herb 2 and their fused molecular interaction representation, is there an effective association between Herb 1 and Herb 2?",
+            "predict_req": "\nPlease take into account the names of the herbal components and their interaction representation (array), and generate the predictions <|reg_g|>."
         }
         
         # -------------------------- 5. 加载/生成样本（核心优化：缓存逻辑） --------------------------
@@ -530,7 +536,8 @@ class ProcessDatasets(LightningDataModule):
         self.tokenizer = tokenizer
         if tokenizer is None:
             raise ValueError("Tokenizer未传入！")
-        self.mol_token_id = self.tokenizer.mol_token_id
+        # [核心修改] 统一获取 interaction_token_id
+        self.interaction_token_id = self.tokenizer.interaction_token_id
         self.reg_token_id = self.tokenizer.reg_token_id
 
     def train_dataloader(self):
@@ -542,7 +549,8 @@ class ProcessDatasets(LightningDataModule):
             pin_memory=False,
             drop_last=True,
             persistent_workers=True if self.num_workers > 0 else False,
-            collate_fn=TrainCollater(self.tokenizer, self.text_max_len, self.mol_token_id, self.reg_token_id),
+            # [核心修改] 传入 interaction_token_id
+            collate_fn=TrainCollater(self.tokenizer, self.text_max_len, self.interaction_token_id, self.reg_token_id),
         )
         return loader
 
@@ -555,7 +563,8 @@ class ProcessDatasets(LightningDataModule):
             pin_memory=False,
             drop_last=False,
             persistent_workers=True if self.num_workers > 0 else False,
-            collate_fn=TrainCollater(self.tokenizer, self.text_max_len, self.mol_token_id, self.reg_token_id),
+            # [核心修改] 传入 interaction_token_id
+            collate_fn=TrainCollater(self.tokenizer, self.text_max_len, self.interaction_token_id, self.reg_token_id),
         )
         test_loader = DataLoader(
             self.test_dataset,
@@ -565,7 +574,8 @@ class ProcessDatasets(LightningDataModule):
             pin_memory=False,
             drop_last=False,
             persistent_workers=True if self.num_workers > 0 else False,
-            collate_fn=InferenceCollater(self.tokenizer, self.text_max_len, self.mol_token_id, self.reg_token_id),
+            # [核心修改] 传入 interaction_token_id
+            collate_fn=InferenceCollater(self.tokenizer, self.text_max_len, self.interaction_token_id, self.reg_token_id),
         )
         return [val_loader, test_loader]
 
@@ -578,7 +588,8 @@ class ProcessDatasets(LightningDataModule):
             pin_memory=False,
             drop_last=False,
             persistent_workers=True if self.num_workers > 0 else False,
-            collate_fn=InferenceCollater(self.tokenizer, self.text_max_len, self.mol_token_id, self.reg_token_id),
+            # [核心修改] 传入 interaction_token_id
+            collate_fn=InferenceCollater(self.tokenizer, self.text_max_len, self.interaction_token_id, self.reg_token_id),
         )
         return loader
 

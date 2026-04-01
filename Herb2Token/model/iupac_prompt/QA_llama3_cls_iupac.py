@@ -42,13 +42,22 @@ def init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio):
     ln_graph = nn.LayerNorm(4096)
     return molecule_model, ln_graph
 
-def init_mol2latent(gin_hidden_dim):
-    mol2latent = nn.Linear(gin_hidden_dim, 768)
-    input_model_path = project_root / 'GNN_pretrained/output_model/mol2latent_model_final.pth'
-    print("Loading from {}...".format(input_model_path))
-    state_dict = torch.load(input_model_path, map_location='cpu')
-    mol2latent.load_state_dict(state_dict)
-    return mol2latent
+# ===== 新增：启发式匹配融合模块 (Heuristic Matching Fusion) =====
+class HeuristicMatchingFusion(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(HeuristicMatchingFusion, self).__init__()
+        # 对应公式: MLP([H_{A|B} || H_{B|A} || (H_{A|B} * H_{B|A}) || |H_{A|B} - H_{B|A}|])
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim * 4, input_dim * 2),
+            nn.GELU(),
+            nn.Linear(input_dim * 2, output_dim)
+        )
+
+    def forward(self, h_A, h_B):
+        h_mul = h_A * h_B
+        h_diff = torch.abs(h_A - h_B)
+        h_concat = torch.cat([h_A, h_B, h_mul, h_diff], dim=-1)
+        return self.mlp(h_concat)
 
 class ReprogrammingLayer(nn.Module):
     def __init__(self, attention_dim, graph_dim, n_heads, d_keys=None, llm_dim=None, attention_dropout=0.1):
@@ -96,26 +105,26 @@ class Align2llama(nn.Module):
         self.graph_encoder, self.ln_graph = init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio)
         self.tune_gnn = tune_gnn
 
-        # 2. 引入重构后的多示例编码器，代理图特征提取
+        # 2. 多示例编码器，提取交互环境下的宏观表征
         self.herb_encoder = HerbMultiInstanceEncoder(self.graph_encoder, hidden_dim=gin_hidden_dim)
         
-        # 3. 初始化对齐潜空间映射
-        self.mol2latent = init_mol2latent(gin_hidden_dim)
+        # 3. 启发式匹配融合网络 (Heuristic Matching Fusion)
+        self.graph_dim = 768  
+        self.fusion_layer = HeuristicMatchingFusion(input_dim=gin_hidden_dim, output_dim=self.graph_dim)
 
-        # 4. 执行底层冻结逻辑
         if not self.tune_gnn:
-            # 仅微调 GNN 的最顶层
             self.graph_encoder.freeze_bottom_layers(tune_layers=1)
-            # 冻结 mol2latent
-            for param in self.mol2latent.parameters():
-                param.requires_grad = False
-            logging.info("GNN bottom layers and mol2latent are frozen.")
+            logging.info("GNN bottom layers are frozen.")
+            # 注意: self.fusion_layer 是全新初始化的，必须参与训练，无需 freeze
 
         self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_model, use_fast=False, padding_side='right')
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.pad_token_id = self.llm_tokenizer.pad_token_id 
-        self.llm_tokenizer.add_special_tokens({'additional_special_tokens': ['<|mol_g|>']})  
-        self.llm_tokenizer.mol_token_id = self.llm_tokenizer("<|mol_g|>", add_special_tokens=False).input_ids[0]
+        
+        # 修改点：将原先的 <|mol_g|> 替换为单 token <|herb_interaction|>
+        self.llm_tokenizer.add_special_tokens({'additional_special_tokens': ['<|herb_interaction|>']})  
+        self.llm_tokenizer.interaction_token_id = self.llm_tokenizer("<|herb_interaction|>", add_special_tokens=False).input_ids[0]
+        
         self.llm_tokenizer.add_special_tokens({'additional_special_tokens': ['<|reg_g|>']}) 
         self.llm_tokenizer.reg_token_id = self.llm_tokenizer("<|reg_g|>", add_special_tokens=False).input_ids[0]
 
@@ -136,9 +145,8 @@ class Align2llama(nn.Module):
 
         self.llm_model_holder = [_llm_model]
 
-        self.new_add_token = 3
+        self.new_add_token = 3 # pad, herb_interaction, reg_g
         self.num_tokens = 100
-        self.graph_dim = 768  
         self.attention_dim = 512
         self.n_head = 8
         self.key = self.attention_dim // self.n_head
@@ -148,6 +156,8 @@ class Align2llama(nn.Module):
         self.word_embeddings = self.llm_model.get_input_embeddings().weight[:-self.new_add_token]
         self.vocab_size = self.word_embeddings.shape[0]
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
+        
+        # ReprogrammingLayer 等价于计算：Q=HW_Q, K=M'W_K, V=M'W_V, Softmax(QK^T/sqrt(d))V
         self.reprogramming_layer = ReprogrammingLayer(self.attention_dim, self.graph_dim, self.n_head, self.key, self.llm_dim)
         self.score = nn.Linear(self.llm_dim, 2, bias=False)
         self.softmax = nn.Softmax(dim=-1)
@@ -166,31 +176,36 @@ class Align2llama(nn.Module):
         if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
             instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
             instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_mol_token'):
-                instruction_tokens.is_mol_token = instruction_tokens.is_mol_token[:, :MAX_SEQ_LEN]
+            # 注意：此处需跟随 dataloader 中的新变量名，假设我们已将其修改为 is_interaction_token
+            if hasattr(instruction_tokens, 'is_interaction_token'):
+                instruction_tokens.is_interaction_token = instruction_tokens.is_interaction_token[:, :MAX_SEQ_LEN]
             if hasattr(instruction_tokens, 'is_reg_token'):
                 instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
 
-        # 核心：使用多示例图编码器提取相互激发的宏观表征
+        # 核心 1：多示例图编码器提取相互激发的宏观表征
         H_A_given_B, H_B_given_A = self.herb_encoder(batched_A, batched_B)
 
-        # 映射到 768 潜空间以适配 ReprogrammingLayer
-        H_A_latent = self.mol2latent(H_A_given_B)
-        H_B_latent = self.mol2latent(H_B_given_A)
+        # 核心 2：启发式匹配融合，捕捉共性与差异
+        H_interaction = self.fusion_layer(H_A_given_B, H_B_given_A)
 
-        # 拼接以满足 [Batch, 2, 768] 的双图输入
-        h_graph = torch.cat([H_A_latent.unsqueeze(1), H_B_latent.unsqueeze(1)], dim=1)
+        # 扩充维度以适配 ReprogrammingLayer [Batch, Length=1, 768]
+        h_graph = H_interaction.unsqueeze(1)
 
         word_embeddings = self.llm_model.get_input_embeddings().weight[:-self.new_add_token]
         source_embeddings = self.mapping_layer(word_embeddings.permute(1, 0)).permute(1, 0)
 
+        # 核心 3：词表降维检索与生成 Token (由 ReprogrammingLayer 完成交叉注意力)
         graph_inputs_llm = self.reprogramming_layer(h_graph, source_embeddings, source_embeddings)
         graph_inputs_llm = self.ln_graph(graph_inputs_llm)
         instruction_embeds = self.llm_model.get_input_embeddings()(instruction_tokens.input_ids)
         word_embeddings_avg = word_embeddings.mean(dim=0, keepdim=True)
 
-        instruction_embeds[instruction_tokens.is_mol_token] = graph_inputs_llm.flatten(0, 1).to(instruction_embeds.dtype)
-        instruction_embeds[instruction_tokens.is_reg_token] = word_embeddings_avg.repeat(graph_inputs_llm.size()[0], 1).to(instruction_embeds.dtype)
+        # 注入生成的 <herb_interaction> 特征
+        instruction_embeds[instruction_tokens.is_interaction_token] = graph_inputs_llm.flatten(0, 1).to(instruction_embeds.dtype)
+        
+        # 可选的 reg 占位操作 (原逻辑保留)
+        if hasattr(instruction_tokens, 'is_reg_token'):
+            instruction_embeds[instruction_tokens.is_reg_token] = word_embeddings_avg.repeat(graph_inputs_llm.size()[0], 1).to(instruction_embeds.dtype)
 
         outputs = self.llm_model(
             inputs_embeds=instruction_embeds,
@@ -223,17 +238,14 @@ class Align2llama(nn.Module):
         if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
             instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
             instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_mol_token'):
-                instruction_tokens.is_mol_token = instruction_tokens.is_mol_token[:, :MAX_SEQ_LEN]
+            if hasattr(instruction_tokens, 'is_interaction_token'):
+                instruction_tokens.is_interaction_token = instruction_tokens.is_interaction_token[:, :MAX_SEQ_LEN]
             if hasattr(instruction_tokens, 'is_reg_token'):
                 instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
 
         H_A_given_B, H_B_given_A = self.herb_encoder(batched_A, batched_B)
-
-        H_A_latent = self.mol2latent(H_A_given_B)
-        H_B_latent = self.mol2latent(H_B_given_A)
-
-        h_graph = torch.cat([H_A_latent.unsqueeze(1), H_B_latent.unsqueeze(1)], dim=1)
+        H_interaction = self.fusion_layer(H_A_given_B, H_B_given_A)
+        h_graph = H_interaction.unsqueeze(1)
 
         word_embeddings = self.llm_model.get_input_embeddings().weight[:-self.new_add_token]
         source_embeddings = self.mapping_layer(word_embeddings.permute(1, 0)).permute(1, 0)
@@ -243,8 +255,10 @@ class Align2llama(nn.Module):
         instruction_embeds = self.llm_model.get_input_embeddings()(instruction_tokens.input_ids)
         word_embeddings_avg = word_embeddings.mean(dim=0, keepdim=True)
 
-        instruction_embeds[instruction_tokens.is_mol_token] = graph_inputs_llm.flatten(0, 1).to(instruction_embeds.dtype)
-        instruction_embeds[instruction_tokens.is_reg_token] = word_embeddings_avg.repeat(graph_inputs_llm.size()[0], 1).to(instruction_embeds.dtype)
+        instruction_embeds[instruction_tokens.is_interaction_token] = graph_inputs_llm.flatten(0, 1).to(instruction_embeds.dtype)
+        
+        if hasattr(instruction_tokens, 'is_reg_token'):
+            instruction_embeds[instruction_tokens.is_reg_token] = word_embeddings_avg.repeat(graph_inputs_llm.size()[0], 1).to(instruction_embeds.dtype)
 
         outputs = self.llm_model(
             inputs_embeds=instruction_embeds,
