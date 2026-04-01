@@ -22,8 +22,6 @@ class HerbMultiInstanceEncoder(nn.Module):
             batched_B: 包含草药 B 集合中所有分子的 PyG Batched Graph
         """
         # 1. 提取每个分子的特征 h_{A,i} 和 h_{B,j}
-        # 假设 gnn(batch) 返回 (node_representation, graph_representation) 或者类似结构
-        # 这里取返回值的第一个，代表图的整体或汇聚前特征。后续要在集成时确保 GNN 输出匹配 [total_mols, hidden_dim]
         h_A, _ = self.gnn(batched_A)  
         h_B, _ = self.gnn(batched_B)  
         
@@ -38,26 +36,22 @@ class HerbMultiInstanceEncoder(nn.Module):
         # 3. 交叉动态注意力计算 ("君臣佐使" 动态激活)
         
         # --- 草药 A 被 B 激发 ---
-        # 广播 Query 以对齐分子数量
         expanded_H_B = H_B_mean[herb_batch_A]
-        # 公式: e_{A,i} = (h_{A,i})^T W_attn (H_{B_mean})
         h_A_proj = self.W_attn(h_A)
         e_A = torch.sum(h_A_proj * expanded_H_B, dim=-1)
-        # 公式: \alpha_{A,i} = Softmax(e_{A,i})
         alpha_A = softmax(e_A, index=herb_batch_A)
-        # 公式: H_{A|B} = \sum \alpha_{A,i} h_{A,i}
         H_A_given_B = global_add_pool(alpha_A.unsqueeze(-1) * h_A, herb_batch_A) 
 
         # --- 草药 B 被 A 激发 ---
-        # 广播 Query 以对齐分子数量
         expanded_H_A = H_A_mean[herb_batch_B]
-        # 公式: e_{B,j} = (h_{B,j})^T W_attn (H_{A_mean})
         h_B_proj = self.W_attn(h_B)
         e_B = torch.sum(h_B_proj * expanded_H_A, dim=-1)
-        # 公式: \alpha_{B,j} = Softmax(e_{B,j})
         alpha_B = softmax(e_B, index=herb_batch_B)
-        # 公式: H_{B|A} = \sum \alpha_{B,j} h_{B,j}
         H_B_given_A = global_add_pool(alpha_B.unsqueeze(-1) * h_B, herb_batch_B) 
         
-        # 4. 直接返回激活后的宏观特征供 LLM 作为 Token 读取
-        return H_A_given_B, H_B_given_A
+        # ==========================================================
+        # 阶段 3 核心修改：解绑底层特征输出
+        # 除了宏观融合特征外，将底层微观特征(h_A, h_B)和动态注意力权重(alpha_A, alpha_B)一并返回
+        # 这为下游 LLM 外部隐空间提取 Top-1 核心成分进行 Micro-Reconstruction 提供了数据支撑
+        # ==========================================================
+        return H_A_given_B, H_B_given_A, h_A, h_B, alpha_A, alpha_B

@@ -1,6 +1,6 @@
 import logging
 import os
-import math
+import math  # [阶段 3 新增]: 用于计算余弦退火
 
 import torch
 import torch.nn as nn
@@ -19,7 +19,6 @@ device_map = {'': local_rank}
 
 current_file = Path(__file__).resolve()  
 project_root = current_file.parents[2]  
-
 
 def init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio):
     molecule_node_model = GNN(
@@ -44,11 +43,11 @@ def init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio):
     ln_graph = nn.LayerNorm(4096)
     return molecule_model, ln_graph
 
-
-
+# ==========================================================
+# [阶段 3 新增]: 隐空间物理重构多层感知机 (Reconstruction MLP)
+# ==========================================================
 class ReconstructionMLP(nn.Module):
     """
-    重构多层感知机 (Macro-Reconstruction / Micro-Reconstruction)
     将 LLM 的均值池化隐向量重构回图物理特征空间
     """
     def __init__(self, llm_dim, graph_dim):
@@ -62,11 +61,10 @@ class ReconstructionMLP(nn.Module):
     def forward(self, z):
         return self.net(z)
 
-# ===== 新增：启发式匹配融合模块 (Heuristic Matching Fusion) =====
+# 阶段 2: 启发式匹配融合模块
 class HeuristicMatchingFusion(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(HeuristicMatchingFusion, self).__init__()
-        # 对应公式: MLP([H_{A|B} || H_{B|A} || (H_{A|B} * H_{B|A}) || |H_{A|B} - H_{B|A}|])
         self.mlp = nn.Sequential(
             nn.Linear(input_dim * 4, input_dim * 2),
             nn.GELU(),
@@ -121,30 +119,21 @@ class Align2llama(nn.Module):
             args=None,
     ):
         super().__init__()
-        # 1. 初始化基础 GNN
         self.graph_encoder, self.ln_graph = init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio)
         self.tune_gnn = tune_gnn
-
-        # 2. 多示例编码器，提取交互环境下的宏观表征
         self.herb_encoder = HerbMultiInstanceEncoder(self.graph_encoder, hidden_dim=gin_hidden_dim)
-        
-        # 3. 启发式匹配融合网络 (Heuristic Matching Fusion)
         self.graph_dim = 768  
         self.fusion_layer = HeuristicMatchingFusion(input_dim=gin_hidden_dim, output_dim=self.graph_dim)
 
         if not self.tune_gnn:
             self.graph_encoder.freeze_bottom_layers(tune_layers=1)
             logging.info("GNN bottom layers are frozen.")
-            # 注意: self.fusion_layer 是全新初始化的，必须参与训练，无需 freeze
 
         self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_model, use_fast=False, padding_side='right')
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.pad_token_id = self.llm_tokenizer.pad_token_id 
-        
-        # 修改点：将原先的 <|mol_g|> 替换为单 token <|herb_interaction|>
         self.llm_tokenizer.add_special_tokens({'additional_special_tokens': ['<|herb_interaction|>']})  
         self.llm_tokenizer.interaction_token_id = self.llm_tokenizer("<|herb_interaction|>", add_special_tokens=False).input_ids[0]
-        
         self.llm_tokenizer.add_special_tokens({'additional_special_tokens': ['<|reg_g|>']}) 
         self.llm_tokenizer.reg_token_id = self.llm_tokenizer("<|reg_g|>", add_special_tokens=False).input_ids[0]
 
@@ -165,7 +154,7 @@ class Align2llama(nn.Module):
 
         self.llm_model_holder = [_llm_model]
 
-        self.new_add_token = 3 # pad, herb_interaction, reg_g
+        self.new_add_token = 3 
         self.num_tokens = 100
         self.attention_dim = 512
         self.n_head = 8
@@ -176,60 +165,50 @@ class Align2llama(nn.Module):
         self.word_embeddings = self.llm_model.get_input_embeddings().weight[:-self.new_add_token]
         self.vocab_size = self.word_embeddings.shape[0]
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
-        
-        # ReprogrammingLayer 等价于计算：Q=HW_Q, K=M'W_K, V=M'W_V, Softmax(QK^T/sqrt(d))V
         self.reprogramming_layer = ReprogrammingLayer(self.attention_dim, self.graph_dim, self.n_head, self.key, self.llm_dim)
         self.score = nn.Linear(self.llm_dim, 2, bias=False)
         self.softmax = nn.Softmax(dim=-1)
 
-        for param in self.mapping_layer.parameters():
-            param.requires_grad = False
-
-        # 4. 多任务联合优化重构网络 (阶段 3 核心)
+        # ==========================================================
+        # [阶段 3 新增]: 初始化重构网络与退火超参数
+        # ==========================================================
         self.recon_mlp = ReconstructionMLP(llm_dim=self.llm_dim, graph_dim=self.graph_dim)
-        # 硬到软物理锚点退火参数
         self.lambda_min = 0.01
         self.lambda_max = 1.0
+
+        for param in self.mapping_layer.parameters():
+            param.requires_grad = False
 
     @property
     def llm_model(self):
         return self.llm_model_holder[0]
 
+    # [阶段 3 新增]: forward 增加 current_epoch 和 max_epochs 参数
     def forward(self, batch, current_epoch=0, max_epochs=50):
         batched_A, batched_B, instruction_tokens, label_values = batch
         
-        MAX_SEQ_LEN = 512  
-        if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
-            instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
-            instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
-            # 注意：此处需跟随 dataloader 中的新变量名，假设我们已将其修改为 is_interaction_token
-            if hasattr(instruction_tokens, 'is_interaction_token'):
-                instruction_tokens.is_interaction_token = instruction_tokens.is_interaction_token[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_reg_token'):
-                instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
+        # (已注释掉暴力阶段，防止截断 <|herb_interaction|>)
+        # MAX_SEQ_LEN = 512  
+        # if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
+        #     instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
+        #     ...
 
-        # 核心 1：多示例图编码器提取相互激发的宏观表征
-        H_A_given_B, H_B_given_A = self.herb_encoder(batched_A, batched_B)
+        # [阶段 3 修改]: 解包步骤 1 返回的 6 个参数
+        H_A_given_B, H_B_given_A, h_A, h_B, alpha_A, alpha_B = self.herb_encoder(batched_A, batched_B)
 
-        # 核心 2：启发式匹配融合，捕捉共性与差异
         H_interaction = self.fusion_layer(H_A_given_B, H_B_given_A)
-
-        # 扩充维度以适配 ReprogrammingLayer [Batch, Length=1, 768]
         h_graph = H_interaction.unsqueeze(1)
 
         word_embeddings = self.llm_model.get_input_embeddings().weight[:-self.new_add_token]
         source_embeddings = self.mapping_layer(word_embeddings.permute(1, 0)).permute(1, 0)
 
-        # 核心 3：词表降维检索与生成 Token (由 ReprogrammingLayer 完成交叉注意力)
         graph_inputs_llm = self.reprogramming_layer(h_graph, source_embeddings, source_embeddings)
         graph_inputs_llm = self.ln_graph(graph_inputs_llm)
         instruction_embeds = self.llm_model.get_input_embeddings()(instruction_tokens.input_ids)
         word_embeddings_avg = word_embeddings.mean(dim=0, keepdim=True)
 
-        # 注入生成的 <herb_interaction> 特征
         instruction_embeds[instruction_tokens.is_interaction_token] = graph_inputs_llm.flatten(0, 1).to(instruction_embeds.dtype)
         
-        # 可选的 reg 占位操作 (原逻辑保留)
         if hasattr(instruction_tokens, 'is_reg_token'):
             instruction_embeds[instruction_tokens.is_reg_token] = word_embeddings_avg.repeat(graph_inputs_llm.size()[0], 1).to(instruction_embeds.dtype)
 
@@ -242,23 +221,41 @@ class Align2llama(nn.Module):
         output = outputs.last_hidden_state  
         
         # ==========================================================
-        # 阶段 3 核心：知识唤醒与硬到软退火重构防幻觉机制
+        # [阶段 3 核心]: 隐式思维链 (CoT) 提取与物理约束退火
         # ==========================================================
-        # 步骤 1: 隐状态均值池化，提取精缩版 Z_final (排除 Padding)
-        mask = (instruction_tokens.input_ids != self.pad_token_id).float().unsqueeze(-1)
+        # 1. 均值池化提取代表大模型推理全过程的浓缩隐向量 Z_final
+        mask = (instruction_tokens.attention_mask).float().unsqueeze(-1)
         z_final = (output * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8) # [B, 4096]
 
-        # 步骤 2: 重构回物理图空间
+        # 2. 将隐向量重构回图特征空间
         H_recon = self.recon_mlp(z_final) # [B, 768]
-        # 注意: 此处将 H_interaction detach，确保重构不干扰底层图编码器训练，只约束 LLM
-        loss_recon = nn.MSELoss()(H_recon, H_interaction.detach())
+        
+        # 3. 宏观消融基准 (Macro-Reconstruction: 重构整体特征)
+        loss_recon_macro = nn.MSELoss()(H_recon, H_interaction.detach())
+        
+        # 4. 微观消融基准 (Micro-Reconstruction: 重构 Top-1 核心成分)
+        batch_size = H_interaction.size(0)
+        h_A_top1_list, h_B_top1_list = [], []
+        for i in range(batch_size):
+            mask_A = (batched_A.herb_batch == i)
+            top1_idx_A = torch.argmax(alpha_A[mask_A])
+            h_A_top1_list.append(h_A[mask_A][top1_idx_A])
+            
+            mask_B = (batched_B.herb_batch == i)
+            top1_idx_B = torch.argmax(alpha_B[mask_B])
+            h_B_top1_list.append(h_B[mask_B][top1_idx_B])
+            
+        H_interaction_micro = self.fusion_layer(torch.stack(h_A_top1_list), torch.stack(h_B_top1_list))
+        loss_recon_micro = nn.MSELoss()(H_recon, H_interaction_micro.detach())
+        
+        # 此处使用宏观重构作为默认主约束，您可以根据消融实验需要将其切换为 loss_recon_micro
+        loss_recon = loss_recon_macro 
 
-        # 步骤 3: 动态衰减惩罚权重 (Cosine Annealing)
+        # 5. 硬到软物理锚点退火 (Cosine Annealing)
         e_ratio = min(current_epoch / max(max_epochs, 1), 1.0)
         lambda_e = self.lambda_min + 0.5 * (self.lambda_max - self.lambda_min) * (1 + math.cos(e_ratio * math.pi))
         # ==========================================================
 
-        # 原分类主逻辑 (预测最后一个 token 的分类值)
         sequence_lengths = torch.eq(instruction_tokens.input_ids, self.pad_token_id).int().argmax(-1) - 1
         sequence_lengths = sequence_lengths % instruction_tokens.input_ids.shape[-1]
         sequence_lengths = sequence_lengths.to(output.device)
@@ -270,10 +267,10 @@ class Align2llama(nn.Module):
         logits = self.score(output_token_embedding)
         loss_cls = CrossEntropyLoss()(logits.view(-1, 2), label_values.view(-1))
         
-        # 最终损失闭环！
+        # 6. 多任务联合优化
         loss_total = loss_cls + lambda_e * loss_recon
         
-        # 可在训练日志中输出拆解损失，方便观察退火曲线
+        # 将子损失分离返回，方便在 Trainer 中进行日志记录
         return {"loss": loss_total, "loss_cls": loss_cls, "loss_recon": loss_recon}
 
     @torch.no_grad()
@@ -282,16 +279,9 @@ class Align2llama(nn.Module):
         batched_B = samples['batched_B']
         instruction_tokens = samples['instruction_tokens']
         
-        MAX_SEQ_LEN = 512
-        if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
-            instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
-            instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_interaction_token'):
-                instruction_tokens.is_interaction_token = instruction_tokens.is_interaction_token[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_reg_token'):
-                instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
-
-        H_A_given_B, H_B_given_A = self.herb_encoder(batched_A, batched_B)
+        # [阶段 3 修改]: 同样在推理时解包 6 个参数，防止报错
+        H_A_given_B, H_B_given_A, h_A, h_B, alpha_A, alpha_B = self.herb_encoder(batched_A, batched_B)
+        
         H_interaction = self.fusion_layer(H_A_given_B, H_B_given_A)
         h_graph = H_interaction.unsqueeze(1)
 
