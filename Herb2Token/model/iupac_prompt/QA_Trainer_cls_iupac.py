@@ -198,13 +198,30 @@ class QA_Trainer(pl.LightningModule):
             f.write(json.dumps(line, ensure_ascii=True) + '\n')
 
     def training_step(self, batch, batch_idx):
-        # ========== 修改6：删除手动scheduler.step，由PyTorch Lightning自动管理 ==========
-        batch_size = batch[-1].size(0)
-        # ============== Overall Loss ===================#
-        loss = self.blip2opt(batch)
-        self.log("molecule loss", float(loss['loss']), batch_size=batch_size, sync_dist=True)
-        self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], batch_size=batch_size, sync_dist=True)
-        return loss['loss']
+            # ========== 修改6：删除手动scheduler.step，由PyTorch Lightning自动管理 ==========
+            batch_size = batch[-1].size(0)
+            # ============== Overall Loss ===================#
+            
+            # ========== 阶段 3 核心修改：传入 epoch 信息用于硬到软物理锚点退火 ==========
+            loss_dict = self.blip2opt(
+                batch, 
+                current_epoch=self.current_epoch, 
+                max_epochs=self.max_epochs
+            )
+            # =======================================================================
+            
+            # 记录总损失
+            self.log("molecule loss", float(loss_dict['loss']), batch_size=batch_size, sync_dist=True)
+            
+            # 记录分类主任务损失和重构物理损失（方便观察退火过程）
+            if 'loss_cls' in loss_dict:
+                self.log("loss_cls", float(loss_dict['loss_cls']), batch_size=batch_size, sync_dist=True)
+            if 'loss_recon' in loss_dict:
+                self.log("loss_recon", float(loss_dict['loss_recon']), batch_size=batch_size, sync_dist=True)
+                
+            self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], batch_size=batch_size, sync_dist=True)
+            
+            return loss_dict['loss']
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, dataloader_idx):

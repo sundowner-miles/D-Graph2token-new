@@ -1,6 +1,7 @@
 import torch
 
 ckpt_path = "all_checkpoints/debug/interrupted_last.ckpt"
+# ckpt_path = "all_checkpoints/debug/last.ckpt"
 ckpt = torch.load(ckpt_path, map_location="cpu")
 
 # 打印核心字段是否存在

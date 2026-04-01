@@ -437,32 +437,30 @@ class HerbHerbDataset(Dataset):
             h2_comp_names = h2_comp['Ingredient_Name'].iloc[0] if not h2_comp.empty else []
             h2_smiles_list = h2_comp['SMILES'].iloc[0] if not h2_comp.empty else []
 
-            # 过滤无成分的无效样本
+# 过滤无成分的无效样本
             if not h1_comp_names and not h2_comp_names:
                 continue
 
-            # 处理空成分列表
             h1_comp_names = h1_comp_names if h1_comp_names else ["Unknown Component"]
             h2_comp_names = h2_comp_names if h2_comp_names else ["Unknown Component"]
-            h1_smiles_list = h1_smiles_list if h1_smiles_list else [""]
-            h2_smiles_list = h2_smiles_list if h2_smiles_list else [""]
 
-            # 生成成分名称字符串
-            h1_comp_str = "\n".join([f"- {name}" for name in h1_comp_names])
-            h2_comp_str = "\n".join([f"- {name}" for name in h2_comp_names])
+            # ==========================================================
+            # 阶段 3 核心：知识唤醒与 Prompt 精准注入
+            # ==========================================================
+            # 提取 Top-K (设为 5) 核心成分，模拟 GNN 高响应化学名
+            top_k = 5
+            h1_comp_str = ", ".join([f"[{name}]" for name in h1_comp_names[:top_k]])
+            h2_comp_str = ", ".join([f"[{name}]" for name in h2_comp_names[:top_k]])
 
-            # 拼接完整Prompt
+            # 彻底弃用冗杂的 prompt_template 字典，采用直入直出式轻量引导
             full_prompt = (
-                self.prompt_template["herb1_name"].format(herb1_name=h1_name) +
-                self.prompt_template["herb2_name"].format(herb2_name=h2_name) +
-                self.prompt_template["herb1_comp"].format(herb1_comp_str=h1_comp_str) +
-                self.prompt_template["herb2_comp"].format(herb2_comp_str=h2_comp_str) +
-                self.prompt_template["graph_info"] +
-                self.prompt_template["instruction"] +
-                self.prompt_template["predict_req"]
+                f"Analyze the association between Herb A (main active ingredients: {h1_comp_str}) "
+                f"and Herb B (main active ingredients: {h2_comp_str}). "
+                f"Based on their interaction representation <|herb_interaction|>, "
+                f"explain the chemical rationale first, and then output the prediction <|reg_g|>."
             )
+            # ==========================================================
 
-            # 新逻辑：分别生成 A 和 B 的图列表
             graphs_A = herb_smiles_list2graphs(h1_smiles_list)
             graphs_B = herb_smiles_list2graphs(h2_smiles_list)
             

@@ -1,5 +1,6 @@
 import logging
 import os
+import math
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ device_map = {'': local_rank}
 
 current_file = Path(__file__).resolve()  
 project_root = current_file.parents[2]  
+
 
 def init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio):
     molecule_node_model = GNN(
@@ -41,6 +43,24 @@ def init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio):
     molecule_model.load_state_dict(state_dict)
     ln_graph = nn.LayerNorm(4096)
     return molecule_model, ln_graph
+
+
+
+class ReconstructionMLP(nn.Module):
+    """
+    重构多层感知机 (Macro-Reconstruction / Micro-Reconstruction)
+    将 LLM 的均值池化隐向量重构回图物理特征空间
+    """
+    def __init__(self, llm_dim, graph_dim):
+        super(ReconstructionMLP, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(llm_dim, llm_dim // 2),
+            nn.GELU(),
+            nn.Linear(llm_dim // 2, graph_dim)
+        )
+
+    def forward(self, z):
+        return self.net(z)
 
 # ===== 新增：启发式匹配融合模块 (Heuristic Matching Fusion) =====
 class HeuristicMatchingFusion(nn.Module):
@@ -165,11 +185,17 @@ class Align2llama(nn.Module):
         for param in self.mapping_layer.parameters():
             param.requires_grad = False
 
+        # 4. 多任务联合优化重构网络 (阶段 3 核心)
+        self.recon_mlp = ReconstructionMLP(llm_dim=self.llm_dim, graph_dim=self.graph_dim)
+        # 硬到软物理锚点退火参数
+        self.lambda_min = 0.01
+        self.lambda_max = 1.0
+
     @property
     def llm_model(self):
         return self.llm_model_holder[0]
 
-    def forward(self, batch):
+    def forward(self, batch, current_epoch=0, max_epochs=50):
         batched_A, batched_B, instruction_tokens, label_values = batch
         
         MAX_SEQ_LEN = 512  
@@ -214,6 +240,25 @@ class Align2llama(nn.Module):
         )
 
         output = outputs.last_hidden_state  
+        
+        # ==========================================================
+        # 阶段 3 核心：知识唤醒与硬到软退火重构防幻觉机制
+        # ==========================================================
+        # 步骤 1: 隐状态均值池化，提取精缩版 Z_final (排除 Padding)
+        mask = (instruction_tokens.input_ids != self.pad_token_id).float().unsqueeze(-1)
+        z_final = (output * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8) # [B, 4096]
+
+        # 步骤 2: 重构回物理图空间
+        H_recon = self.recon_mlp(z_final) # [B, 768]
+        # 注意: 此处将 H_interaction detach，确保重构不干扰底层图编码器训练，只约束 LLM
+        loss_recon = nn.MSELoss()(H_recon, H_interaction.detach())
+
+        # 步骤 3: 动态衰减惩罚权重 (Cosine Annealing)
+        e_ratio = min(current_epoch / max(max_epochs, 1), 1.0)
+        lambda_e = self.lambda_min + 0.5 * (self.lambda_max - self.lambda_min) * (1 + math.cos(e_ratio * math.pi))
+        # ==========================================================
+
+        # 原分类主逻辑 (预测最后一个 token 的分类值)
         sequence_lengths = torch.eq(instruction_tokens.input_ids, self.pad_token_id).int().argmax(-1) - 1
         sequence_lengths = sequence_lengths % instruction_tokens.input_ids.shape[-1]
         sequence_lengths = sequence_lengths.to(output.device)
@@ -223,10 +268,13 @@ class Align2llama(nn.Module):
         label_values = label_values.to(self.score.weight.device)  
 
         logits = self.score(output_token_embedding)
-        loss_fct = CrossEntropyLoss()
-        loss_cls = loss_fct(logits.view(-1, 2), label_values.view(-1))
+        loss_cls = CrossEntropyLoss()(logits.view(-1, 2), label_values.view(-1))
         
-        return {"loss": loss_cls}
+        # 最终损失闭环！
+        loss_total = loss_cls + lambda_e * loss_recon
+        
+        # 可在训练日志中输出拆解损失，方便观察退火曲线
+        return {"loss": loss_total, "loss_cls": loss_cls, "loss_recon": loss_recon}
 
     @torch.no_grad()
     def generate(self, samples, num_beams=None):
