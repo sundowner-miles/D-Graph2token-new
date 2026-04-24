@@ -61,7 +61,7 @@ def main(args):
 
     # 2. 原有ModelCheckpoint回调（已修正）
     checkpoint_callback = plc.ModelCheckpoint(
-        dirpath="all_checkpoints/" + args.filename + "/",
+        dirpath="all_checkpoints1/" + args.filename + "/",
         # 修正：将 {auc_roc} 改为 {val_auc_roc}，与 File 2 中 log 的名称严格一致
         filename='{epoch:02d}-{val_auc_roc:.4f}', 
         
@@ -149,7 +149,7 @@ def get_args():
     parser.add_argument('--accelerator', type=str, default='gpu')
     parser.add_argument('--devices', type=str, default='1')
     parser.add_argument('--precision', type=str, default='16-mixed')
-    parser.add_argument('--max_epochs', type=int, default=80)
+    parser.add_argument('--max_epochs', type=int, default=30)
     parser.add_argument('--accumulate_grad_batches', type=int, default=2)
     parser.add_argument('--check_val_every_n_epoch', type=int, default=1)
     parser.add_argument('--enable_flash', action='store_true', default=False)

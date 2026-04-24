@@ -234,14 +234,14 @@ class Align2llama(nn.Module):
         graphs, instruction_tokens, text_values = batch
         
         # ===================== 1. 暴力截断防线 =====================
-        MAX_SEQ_LEN = 512  
-        if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
-            instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
-            instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_mol_token'):
-                instruction_tokens.is_mol_token = instruction_tokens.is_mol_token[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_reg_token'):
-                instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
+        # MAX_SEQ_LEN = 512  
+        # if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
+        #     instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
+        #     instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
+        #     if hasattr(instruction_tokens, 'is_mol_token'):
+        #         instruction_tokens.is_mol_token = instruction_tokens.is_mol_token[:, :MAX_SEQ_LEN]
+        #     if hasattr(instruction_tokens, 'is_reg_token'):
+        #         instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
         # ==============================================================================
 
         h_graph_feature, _ = self.graph_encoder(graphs)
@@ -295,14 +295,14 @@ class Align2llama(nn.Module):
         instruction_tokens = samples['instruction_tokens']
         
         # ===================== 1. 暴力截断防线 =====================
-        MAX_SEQ_LEN = 512
-        if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
-            instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
-            instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_mol_token'):
-                instruction_tokens.is_mol_token = instruction_tokens.is_mol_token[:, :MAX_SEQ_LEN]
-            if hasattr(instruction_tokens, 'is_reg_token'):
-                instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
+        # MAX_SEQ_LEN = 512
+        # if instruction_tokens.input_ids.shape[1] > MAX_SEQ_LEN:
+        #     instruction_tokens.input_ids = instruction_tokens.input_ids[:, :MAX_SEQ_LEN]
+        #     instruction_tokens.attention_mask = instruction_tokens.attention_mask[:, :MAX_SEQ_LEN]
+        #     if hasattr(instruction_tokens, 'is_mol_token'):
+        #         instruction_tokens.is_mol_token = instruction_tokens.is_mol_token[:, :MAX_SEQ_LEN]
+        #     if hasattr(instruction_tokens, 'is_reg_token'):
+        #         instruction_tokens.is_reg_token = instruction_tokens.is_reg_token[:, :MAX_SEQ_LEN]
         # ==============================================================================
 
         h_graph_feature, _ = self.graph_encoder(graphs)

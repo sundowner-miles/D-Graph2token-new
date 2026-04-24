@@ -103,6 +103,13 @@ class QA_Trainer(pl.LightningModule):
         # ========== 修改1：初始化列表，避免首次访问报错 ==========
         self.list_targets = []
         self.list_predictions = []
+        
+        # ========== 【核心修复：适配早停机制】==========
+        # 初始化一个缓存字典，用于在跳过验证的 Epoch 给早停机制提供上一次的指标
+        self.last_val_metrics = {
+            "val_acc": 0.0, "val_precision": 0.0, "val_recall": 0.0,
+            "val_f1": 0.0, "val_specificity": 0.0, "val_auc_roc": 0.0, "val_aupr": 0.0
+        }
 
     def configure_optimizers(self):
         # 1. 获取训练加载器，计算核心步数
@@ -177,7 +184,7 @@ class QA_Trainer(pl.LightningModule):
 
     # ========== 新增：统一保存所有指标的函数（删除了旧的三个保存函数） ==========
     def save_all_metrics(self, acc, precision, recall, f1, specificity, auc_roc, aupr, stage="val"):
-        if not hasattr(self.logger, 'log_dir'):
+        if not hasattr(self.logger, 'log_dir') or self.logger.log_dir is None:
             os.makedirs("./predictions", exist_ok=True)
             log_dir = "./predictions"
         else:
@@ -227,9 +234,13 @@ class QA_Trainer(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, dataloader_idx):
         if dataloader_idx == 0:
-            pass
+                    # 如果 dataloader 0 有自己的指标，记得在这里 log
+                    # self.log("some_other_metric", value)
+                    pass
         elif dataloader_idx == 1:
+            # 检查是否到了评估间隔
             if (self.current_epoch + 1) % self.caption_eval_epoch != 0:
+                # 不做推断计算以节省时间
                 return
             
             # ====== Herb2Token 核心修改：解包双边图数据 ======
@@ -276,19 +287,20 @@ class QA_Trainer(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         if (self.current_epoch + 1) % self.caption_eval_epoch != 0:
+            # ========== 【核心修复：适配早停机制】==========
+            # 即便跳过评估逻辑，也要将上一次缓存的指标发送出去，避免早停找不到指标崩溃
+            for k, v in self.last_val_metrics.items():
+                self.log(k, v, sync_dist=True, prog_bar=True)
             return
 
         list_predictions = self.list_predictions
         list_targets = self.list_targets
 
         if not list_predictions or not list_targets:
-            # 空结果时，所有指标设为0
-            self.log("val_acc", 0.0, sync_dist=True, prog_bar=True)
-            self.log("val_precision", 0.0, sync_dist=True, prog_bar=True)
-            self.log("val_recall", 0.0, sync_dist=True, prog_bar=True)
-            self.log("val_f1", 0.0, sync_dist=True, prog_bar=True)
-            self.log("val_specificity", 0.0, sync_dist=True, prog_bar=True)
-            self.log("val_auc_roc", 0.0, sync_dist=True, prog_bar=True)
+            # 空结果时，不仅要 log 0，也要同步更新缓存
+            for metric_name in self.last_val_metrics.keys():
+                self.log(metric_name, 0.0, sync_dist=True, prog_bar=True)
+                self.last_val_metrics[metric_name] = 0.0
             return
 
         predictions = [tensor for tensor in list_predictions]
@@ -343,26 +355,25 @@ class QA_Trainer(pl.LightningModule):
                 else:
                     specificity = 0.0  # 多分类/单类时特异度无意义
 
-                # 日志打印所有指标（验证集前缀加val_）
-                self.log("val_acc", acc, sync_dist=True, prog_bar=True)
-                self.log("val_precision", precision, sync_dist=True, prog_bar=True)
-                self.log("val_recall", recall, sync_dist=True, prog_bar=True)
-                self.log("val_f1", f1, sync_dist=True, prog_bar=True)
-                self.log("val_specificity", specificity, sync_dist=True, prog_bar=True)
-                self.log("val_auc_roc", auc_roc, sync_dist=True, prog_bar=True)
-                self.log("val_aupr", aupr, sync_dist=True, prog_bar=True)
+                # ========== 【核心修复：适配早停机制】==========
+                # 更新缓存，让没有被评估的 Epoch 能用上这些值
+                self.last_val_metrics = {
+                    "val_acc": acc, "val_precision": precision, "val_recall": recall,
+                    "val_f1": f1, "val_specificity": specificity, 
+                    "val_auc_roc": auc_roc, "val_aupr": aupr
+                }
+
+                # 日志打印所有指标
+                for k, v in self.last_val_metrics.items():
+                    self.log(k, v, sync_dist=True, prog_bar=True)
 
                 # 保存所有指标到文件
                 self.save_all_metrics(acc, precision, recall, f1, specificity, auc_roc, aupr, stage="val")
             else:
-                # 兜底：空结果时指标设为0
-                self.log("val_acc", 0.0, sync_dist=True, prog_bar=True)
-                self.log("val_precision", 0.0, sync_dist=True, prog_bar=True)
-                self.log("val_recall", 0.0, sync_dist=True, prog_bar=True)
-                self.log("val_f1", 0.0, sync_dist=True, prog_bar=True)
-                self.log("val_specificity", 0.0, sync_dist=True, prog_bar=True)
-                self.log("val_auc_roc", 0.0, sync_dist=True, prog_bar=True)
-                self.log("val_aupr", 0.0, sync_dist=True, prog_bar=True)
+                # 兜底：空结果时指标设为0并更新缓存
+                for metric_name in self.last_val_metrics.keys():
+                    self.log(metric_name, 0.0, sync_dist=True, prog_bar=True)
+                    self.last_val_metrics[metric_name] = 0.0
 
     def on_test_epoch_end(self):
         # ========== 修改7：修复on_test_epoch_end的分布式兼容 ==========

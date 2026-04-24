@@ -57,6 +57,8 @@ def main(args):
         verbose=True,               # 打印早停日志
         check_finite=True,          # 检测指标是否为NaN/Inf
         stopping_threshold=0.99,    # 可选：指标达到0.99直接停止（按需设置）
+        strict=False,                  # 【核心修复1】找不到指标时不要报错崩溃，直接跳过本次早停检查
+        check_on_train_epoch_end=False # 【核心修复2】强制规定只在 Validation 结束后检查，不要在 Train 结束时猴急检查
     )
 
     # 2. 原有ModelCheckpoint回调（已修正）
@@ -115,21 +117,18 @@ def main(args):
         try:
             trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
         except KeyboardInterrupt:
-            # 捕获手动 Ctrl+C 或系统的 Kill 信号
             print("Training manually interrupted! Saving current state...")
         except Exception as e:
-            # 捕获其他异常（如 OOM）
             print(f"Training crashed due to Exception: {e}")
+            raise e  # 👈 【核心修复】：把捕获到的异常重新抛出，阻止程序继续往下执行 test
         finally:
-            # 无论什么原因中断，强制在退出前触发一次保存
-            # 注意：DeepSpeed 策略下会自动保存为目录形式
             if trainer.global_rank == 0:
                 print("Force saving interrupted checkpoint...")
             interrupted_ckpt_path = os.path.join(f"./all_checkpoints/{args.filename}/", "interrupted_last.ckpt")
             trainer.save_checkpoint(interrupted_ckpt_path)
             print(f"Saved interrupted state to {interrupted_ckpt_path}")
-        # ==================================
-        
+            
+        # 只有在 trainer.fit() 正常跑完所有 epoch（或者被合法的早停机制正常终止）时，才会走到这里
         trainer.test(model, datamodule=dm)
     elif args.mode == 'eval':
         # trainer.fit_loop.epoch_progress.current.completed = args.caption_eval_epoch - 1

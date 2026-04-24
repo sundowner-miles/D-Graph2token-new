@@ -578,7 +578,7 @@ class ProcessDatasets(LightningDataModule):
         parser.add_argument('--num_workers', type=int, default=2, help="数据加载的worker数")
         parser.add_argument('--batch_size', type=int, default=5, help="训练批次大小")
         parser.add_argument('--inference_batch_size', type=int, default=1, help="推理批次大小")
-        parser.add_argument('--root', type=str, default='data/Herb-Herb_allin/', help="草药数据根路径")
+        parser.add_argument('--root', type=str, default='data/Herb-Herb_HERB/', help="草药数据根路径")
         parser.add_argument('--text_max_len', type=int, default=512, help="文本最大长度（适配长Prompt）")
         parser.add_argument('--split_by_txt', action='store_false', help="是否按独立txt文件划分（默认True，关闭则用csv的split列）")
         # 新增缓存相关参数

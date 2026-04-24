@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import hashlib
 from pathlib import Path
+from tqdm import tqdm
 from pytorch_lightning import LightningDataModule
 from torch_geometric.data import Data, Batch
 from torch.utils.data import DataLoader, Dataset
@@ -13,9 +14,8 @@ from dataprocess.smiles2graph_regression import smiles2graph
 try:
     from torch_geometric.data.data import Data as TGData
     torch.serialization.add_safe_globals([TGData])
-    print("已将 torch_geometric.data.Data 加入 PyTorch 序列化安全白名单")
 except Exception as e:
-    print(f"添加安全白名单失败（低版本PyTorch无需处理）：{e}")
+    pass
 
 class TrainCollater:
     def __init__(self, tokenizer, text_max_len, interaction_token_id, reg_token_id):
@@ -138,6 +138,7 @@ def herb_smiles_list2graphs(smiles_list):
         graph_list.append(empty_data)
     return graph_list
 
+
 class HerbHerbDataset(Dataset):
     def __init__(self, root_path, text_max_len, split="train", split_by_txt=False, use_cache=True, cache_dir=None):
         self.text_max_len = text_max_len
@@ -149,18 +150,16 @@ class HerbHerbDataset(Dataset):
 
         self.cache_dir = Path(cache_dir) if cache_dir else Path(root_path) / "cache"
         self.cache_dir.mkdir(exist_ok=True, parents=True)
-        self.cache_filename = self._get_cache_filename()
+        # [流式存储修改 1]：缓存目标不再是单一文件，而是一个专属文件夹
+        self.cache_folder = self._get_cache_folder()
 
         if self.split_by_txt:
             self.herb_herb_txt_path = os.path.join(root_path, f"{split}.txt")
             self.herb_ing_path = os.path.join(root_path, "Herb-Ingredient.csv")
+            self.herb_herb_df = self._parse_herb_herb_txt(self.herb_herb_txt_path)
         else:
             self.herb_herb_csv_path = os.path.join(root_path, "Herb-Herb.csv")
             self.herb_ing_path = os.path.join(root_path, "Herb-Ingredient.csv")
-
-        if self.split_by_txt:
-            self.herb_herb_df = self._parse_herb_herb_txt(self.herb_herb_txt_path)
-        else:
             self.herb_herb_df = pd.read_csv(self.herb_herb_csv_path, encoding="utf-8")
         
         self.herb_ing_df = pd.read_csv(self.herb_ing_path, encoding="utf-8")
@@ -177,49 +176,88 @@ class HerbHerbDataset(Dataset):
             'SMILES': list
         }).reset_index()
         
-        # [废弃旧的 prompt_template 字典]
-        
-        self.samples = self._load_or_generate_samples()
+        # [流式存储修改 2]：不再将数据全量塞入 self.samples 列表，而是检查/生成文件夹体系
+        self.length = 0
+        self._prepare_stream_cache()
 
-    def _get_cache_filename(self):
-        param_str = f"v3_split={self.split}_txtmaxlen={self.text_max_len}_splitbytxt={self.split_by_txt}"
+    def _get_cache_folder(self):
+        # 增加版本号 v4，强制刷新旧缓存
+        param_str = f"v4_stream_split={self.split}_txtmaxlen={self.text_max_len}_splitbytxt={self.split_by_txt}"
         param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
-        return self.cache_dir / f"herb_herb_samples_{self.split}_{param_hash}.pt"
+        folder = self.cache_dir / f"stream_{self.split}_{param_hash}"
+        return folder
 
-    def _load_samples_cache(self):
-        if not self.cache_filename.exists():
-            return None
-        torch_version = tuple(map(int, torch.__version__.split('.')[:2]))
-        try:
-            if torch_version >= (2, 6):
-                with torch.serialization.safe_globals([TGData]):
-                    samples = torch.load(self.cache_filename, map_location="cpu", weights_only=True)
-            else:
-                samples = torch.load(self.cache_filename, map_location="cpu")
-            return samples
-        except Exception:
+    def _prepare_stream_cache(self):
+        """流式缓存管理器：检查文件夹是否完备，不完备则逐条生成"""
+        self.cache_folder.mkdir(exist_ok=True, parents=True)
+        meta_file = self.cache_folder / "meta_length.txt"
+        
+        # 1. 如果元数据文件存在，说明之前成功生成过，直接读取总长度即可
+        if self.use_cache and meta_file.exists():
+            with open(meta_file, 'r') as f:
+                self.length = int(f.read().strip())
+            print(f"[{self.split}] 发现流式缓存目录，包含 {self.length} 条数据，无需重新生成。")
+            return
+            
+        # 2. 如果没有缓存，开始逐条生成并立即存盘（彻底解决OOM）
+        print(f"[{self.split}] 流式缓存未命中，开始处理 {len(self.herb_herb_df)} 条数据 (进度防OOM模式)...")
+        valid_count = 0
+        
+        for _, herb_pair in tqdm(self.herb_herb_df.iterrows(), total=len(self.herb_herb_df), desc=f"Processing {self.split}"):
+            h1_id = herb_pair['Herb1_ID']
+            h2_id = herb_pair['Herb2_ID']
+            tag = int(herb_pair['tag'])
+
+            h1_comp = self.herb_comp_map[self.herb_comp_map['Herb_ID'] == h1_id]
+            h1_name = h1_comp['Herb_Name'].iloc[0] if not h1_comp.empty else "Herb A"
+            h1_comp_names = h1_comp['Ingredient_Name'].iloc[0] if not h1_comp.empty else []
+            h1_smiles_list = h1_comp['SMILES'].iloc[0] if not h1_comp.empty else []
+
+            h2_comp = self.herb_comp_map[self.herb_comp_map['Herb_ID'] == h2_id]
+            h2_name = h2_comp['Herb_Name'].iloc[0] if not h2_comp.empty else "Herb B"
+            h2_comp_names = h2_comp['Ingredient_Name'].iloc[0] if not h2_comp.empty else []
+            h2_smiles_list = h2_comp['SMILES'].iloc[0] if not h2_comp.empty else []
+
+            if not h1_comp_names and not h2_comp_names:
+                continue
+
+            h1_comp_names = h1_comp_names if h1_comp_names else ["Unknown Component"]
+            h2_comp_names = h2_comp_names if h2_comp_names else ["Unknown Component"]
+            h1_smiles_list = h1_smiles_list if h1_smiles_list else [""]
+            h2_smiles_list = h2_smiles_list if h2_smiles_list else [""]
+
+            top_k = 5
+            h1_comp_str = ", ".join([f"[{name}]" for name in h1_comp_names[:top_k]])
+            h2_comp_str = ", ".join([f"[{name}]" for name in h2_comp_names[:top_k]])
+
+            full_prompt = (
+                f"Analyze the association between {h1_name} (main active ingredients: {h1_comp_str}) "
+                f"and {h2_name} (main active ingredients: {h2_comp_str}). "
+                f"Based on their interaction representation <|herb_interaction|>, "
+                f"explain the chemical rationale first, and then output the prediction <|reg_g|>."
+            )
+
+            graphs_A = herb_smiles_list2graphs(h1_smiles_list)
+            graphs_B = herb_smiles_list2graphs(h2_smiles_list)
+            
+            # [流式存储修改 3]：组装单条样本，立刻保存到硬盘并丢弃变量释放内存
+            sample = (graphs_A, graphs_B, full_prompt, tag)
+            sample_path = self.cache_folder / f"{valid_count}.pt"
+            
             try:
-                samples = torch.load(self.cache_filename, map_location="cpu", weights_only=False)
-                return samples
-            except Exception:
-                return None
+                torch.save(sample, sample_path)
+                valid_count += 1
+            except Exception as e:
+                print(f"保存第 {valid_count} 条数据失败: {e}")
+                
+        # 保存完成后，记录有效数据总长度
+        self.length = valid_count
+        with open(meta_file, "w") as f:
+            f.write(str(valid_count))
+            
+        print(f"[{self.split}] 成功生成流式缓存！共写入 {valid_count} 个独立文件至 {self.cache_folder}")
 
-    def _save_samples_cache(self, samples):
-        try:
-            torch.save(samples, self.cache_filename)
-        except Exception:
-            pass
-
-    def _load_or_generate_samples(self):
-        if self.use_cache:
-            cached_samples = self._load_samples_cache()
-            if cached_samples is not None:
-                return cached_samples
-        samples = self._generate_samples()
-        if self.use_cache:
-            self._save_samples_cache(samples)
-        return samples
-
+    # (旧的 _parse_herb_herb_txt 解析方法保留)
     def _parse_herb_herb_txt(self, txt_path):
         txt_columns = ['Herb1_ID', 'Herb2_ID', 'tag', 'instruction']
         data = []
@@ -252,58 +290,22 @@ class HerbHerbDataset(Dataset):
         df = pd.DataFrame(data)
         return df
 
-    def _generate_samples(self):
-        samples = []
-        for _, herb_pair in self.herb_herb_df.iterrows():
-            h1_id = herb_pair['Herb1_ID']
-            h2_id = herb_pair['Herb2_ID']
-            tag = int(herb_pair['tag'])
-
-            h1_comp = self.herb_comp_map[self.herb_comp_map['Herb_ID'] == h1_id]
-            h1_name = h1_comp['Herb_Name'].iloc[0] if not h1_comp.empty else "Herb A"
-            h1_comp_names = h1_comp['Ingredient_Name'].iloc[0] if not h1_comp.empty else []
-            h1_smiles_list = h1_comp['SMILES'].iloc[0] if not h1_comp.empty else []
-
-            h2_comp = self.herb_comp_map[self.herb_comp_map['Herb_ID'] == h2_id]
-            h2_name = h2_comp['Herb_Name'].iloc[0] if not h2_comp.empty else "Herb B"
-            h2_comp_names = h2_comp['Ingredient_Name'].iloc[0] if not h2_comp.empty else []
-            h2_smiles_list = h2_comp['SMILES'].iloc[0] if not h2_comp.empty else []
-
-            if not h1_comp_names and not h2_comp_names:
-                continue
-
-            h1_comp_names = h1_comp_names if h1_comp_names else ["Unknown Component"]
-            h2_comp_names = h2_comp_names if h2_comp_names else ["Unknown Component"]
-            h1_smiles_list = h1_smiles_list if h1_smiles_list else [""]
-            h2_smiles_list = h2_smiles_list if h2_smiles_list else [""]
-
-            # ==========================================================
-            # [阶段 3 核心] 知识唤醒与 Prompt 注入 (Top-5 核心成分)
-            # ==========================================================
-            top_k = 5
-            h1_comp_str = ", ".join([f"[{name}]" for name in h1_comp_names[:top_k]])
-            h2_comp_str = ", ".join([f"[{name}]" for name in h2_comp_names[:top_k]])
-
-            full_prompt = (
-                f"Analyze the association between {h1_name} (main active ingredients: {h1_comp_str}) "
-                f"and {h2_name} (main active ingredients: {h2_comp_str}). "
-                f"Based on their interaction representation <|herb_interaction|>, "
-                f"explain the chemical rationale first, and then output the prediction <|reg_g|>."
-            )
-            # ==========================================================
-
-            graphs_A = herb_smiles_list2graphs(h1_smiles_list)
-            graphs_B = herb_smiles_list2graphs(h2_smiles_list)
-            
-            samples.append((graphs_A, graphs_B, full_prompt, tag))
-        
-        return samples
-
     def __len__(self):
-        return len(self.samples)
+        # [流式存储修改 4]：直接返回文件总数
+        return self.length
 
     def __getitem__(self, index):
-        return self.samples[index]
+        # [流式存储修改 5]：即用即取。根据索引直接从硬盘读取单条 .pt 文件
+        sample_path = self.cache_folder / f"{index}.pt"
+        
+        # 兼容性读取（为了适配 PyTorch 安全机制和自定义图结构）
+        try:
+            return torch.load(sample_path, map_location="cpu", weights_only=False)
+        except Exception:
+            # 兜底：如果单文件损坏，返回最后一条有效数据以防止训练崩溃
+            fallback_path = self.cache_folder / "0.pt"
+            return torch.load(fallback_path, map_location="cpu", weights_only=False)
+
 
 
 class ProcessDatasets(LightningDataModule):
@@ -348,9 +350,9 @@ class ProcessDatasets(LightningDataModule):
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group("Data module (Herb-Herb Classification)")
         parser.add_argument('--num_workers', type=int, default=2)
-        parser.add_argument('--batch_size', type=int, default=5)
+        parser.add_argument('--batch_size', type=int, default=4)
         parser.add_argument('--inference_batch_size', type=int, default=1)
-        parser.add_argument('--root', type=str, default='data/Herb-Herb_c5000/')
+        parser.add_argument('--root', type=str, default='data/Herb-Herb_HERB/')
         parser.add_argument('--text_max_len', type=int, default=512)
         parser.add_argument('--split_by_txt', action='store_false')
         parser.add_argument('--use_cache', action='store_false')
