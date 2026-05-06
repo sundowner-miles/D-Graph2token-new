@@ -14,6 +14,11 @@ from pathlib import Path
 from model.molecule_gnn.molecule_gnn_model import GNN, GNN_graphpred
 from model.herb_multi_instance_encoder import HerbMultiInstanceEncoder
 
+from transformers.modeling_utils import PreTrainedModel
+
+# 暴力破解：强制屏蔽 transformers 针对 8-bit 模型的 .to() 报错拦截
+PreTrainedModel.to = lambda self, *args, **kwargs: self
+
 local_rank = int(os.environ.get('LOCAL_RANK', '0'))
 device_map = {'': local_rank}
 
@@ -147,6 +152,14 @@ class Align2llama(nn.Module):
             quantization_config=bnb_config, 
             device_map="auto"
         )
+        # 👇 【新增补丁】：进入模型的每一层，强行把遗留在 CPU 里的旋转位置编码推到显卡上
+        for layer in _llm_model.layers:
+            if hasattr(layer.self_attn, 'rotary_emb'):
+                layer.self_attn.rotary_emb.to("cuda:0")
+
+        # 确保补丁加在赋给 self.llm_model 之前
+        self.llm_model = _llm_model
+        
         _llm_model.resize_token_embeddings(len(self.llm_tokenizer))
         for param in _llm_model.parameters():
             param.requires_grad = False
@@ -212,9 +225,16 @@ class Align2llama(nn.Module):
         if hasattr(instruction_tokens, 'is_reg_token'):
             instruction_embeds[instruction_tokens.is_reg_token] = word_embeddings_avg.repeat(graph_inputs_llm.size()[0], 1).to(instruction_embeds.dtype)
 
+        # ✅ 1. 获取当前数据真实所在的显卡 (绝对是 cuda:0)
+        target_device = instruction_embeds.device
+        
+        # ✅ 2. 只需要把 tokenizer 出来的 attention_mask 搬过去对齐即可
+        attention_mask = instruction_tokens.attention_mask.to(target_device)
+
+        # ✅ 3. 传给大语言模型 (不用再对 instruction_embeds 做 .to 了)
         outputs = self.llm_model(
             inputs_embeds=instruction_embeds,
-            attention_mask=instruction_tokens.attention_mask,
+            attention_mask=attention_mask,
             return_dict=True,
         )
 

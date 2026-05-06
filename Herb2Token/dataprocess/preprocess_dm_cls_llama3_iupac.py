@@ -350,9 +350,9 @@ class ProcessDatasets(LightningDataModule):
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group("Data module (Herb-Herb Classification)")
         parser.add_argument('--num_workers', type=int, default=2)
-        parser.add_argument('--batch_size', type=int, default=4)
+        parser.add_argument('--batch_size', type=int, default=5)
         parser.add_argument('--inference_batch_size', type=int, default=1)
-        parser.add_argument('--root', type=str, default='data/Herb-Herb_HERB/')
+        parser.add_argument('--root', type=str, default='data/Herb-Herb_TCMM/')
         parser.add_argument('--text_max_len', type=int, default=512)
         parser.add_argument('--split_by_txt', action='store_false')
         parser.add_argument('--use_cache', action='store_false')
